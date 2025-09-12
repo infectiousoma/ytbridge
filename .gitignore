@@ -1,0 +1,17 @@
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+# Docker
+*.log
+# Editor
+.vscode/
+.idea/
+# Data
+cookies.txt
+downloads/
+# OS
+.DS_Store
+Thumbs.db
