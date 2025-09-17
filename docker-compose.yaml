@@ -5,7 +5,13 @@ services:
     image: python:3.12-slim
     container_name: ytbridge
     working_dir: /app
-    command: ["bash","-lc","pip install --no-cache-dir fastapi uvicorn httpx yt-dlp redis python-multipart && uvicorn yt_bridge:app --host 0.0.0.0 --port ${PORT:-8080}"]
+    command: >
+      bash -lc "
+        apt-get update &&
+        apt-get install -y --no-install-recommends ffmpeg &&
+        pip install --no-cache-dir fastapi uvicorn httpx yt-dlp redis python-multipart &&
+        uvicorn yt_bridge:app --host 0.0.0.0 --port ${PORT:-8080}
+      "
     environment:
       - BACKEND_PROVIDER=${BACKEND_PROVIDER:-invidious}
       - BACKEND_BASE=${BACKEND_BASE:-https://yewtu.be}
