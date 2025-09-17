@@ -5,7 +5,7 @@ services:
     image: python:3.12-slim
     container_name: ytbridge
     working_dir: /app
-    command: bash -lc "pip install --no-cache-dir fastapi uvicorn httpx redis anyio && uvicorn yt_bridge:app --host 0.0.0.0 --port ${PORT:-8080}"
+    command: ["bash","-lc","pip install --no-cache-dir fastapi uvicorn httpx yt-dlp redis python-multipart && uvicorn yt_bridge:app --host 0.0.0.0 --port ${PORT:-8080}"]
     environment:
       - BACKEND_PROVIDER=${BACKEND_PROVIDER:-invidious}
       - BACKEND_BASE=${BACKEND_BASE:-https://yewtu.be}
@@ -18,8 +18,9 @@ services:
       - REDIS_TTL=${REDIS_TTL:-43200}
     volumes:
       - ./yt_bridge.py:/app/yt_bridge.py:ro          # renamed app
-      - ./cookies.txt:/app/cookies.txt:ro            # optional
+      - ./cookies.txt:/app/cookies.txt            # optional
       - ~/.yt-dlp/bin/yt-dlp_linux:/usr/local/bin/yt-dlp_linux:ro
+      - ./data:/data
 #      - /usr/local/bin/yt-dlp:/usr/local/bin/yt-dlp:ro  # host binary mounted in
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
