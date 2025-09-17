@@ -1,8 +1,8 @@
 # yt_bridge.py
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-import os, subprocess, json, urllib.parse, httpx, redis, shlex, re, pathlib, time
+import os, subprocess, json, httpx, redis, re, pathlib, time
 from typing import List, Dict, Any
 
 # ---------- Config ----------
@@ -12,10 +12,10 @@ COOKIES          = os.environ.get("YTDLP_COOKIES", "").strip()
 SPONSORBLOCK     = os.environ.get("SPONSORBLOCK", "true").strip().lower()
 PORT             = int(os.environ.get("PORT", "8080"))
 
-# yt-dlp source selection (no bundling required)
+# yt-dlp source selection
 YTDLP_MODE        = os.environ.get("YTDLP_MODE", "local").strip().lower()    # "local" | "remote"
-YTDLP_CMD         = os.environ.get("YTDLP_CMD", "yt-dlp").strip()            # path to external binary
-YTDLP_REMOTE_URL  = os.environ.get("YTDLP_REMOTE_URL", "").strip()           # e.g. http://ytdlp-api:3030/dump
+YTDLP_CMD         = os.environ.get("YTDLP_CMD", "yt-dlp").strip()
+YTDLP_REMOTE_URL  = os.environ.get("YTDLP_REMOTE_URL", "").strip()
 
 # ffmpeg (for split streams remux)
 FFMPEG_CMD        = os.environ.get("FFMPEG_CMD", "ffmpeg").strip()
@@ -30,7 +30,7 @@ pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 SUBS_PATH = os.path.join(DATA_DIR, "subscriptions.json")
 FAVS_PATH = os.path.join(DATA_DIR, "favorites.json")
 
-app = FastAPI(title="ytbridge", version="0.5.0")
+app = FastAPI(title="ytbridge", version="0.7.0")
 rds = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 app.add_middleware(
     CORSMiddleware,
@@ -96,9 +96,8 @@ def save_favorites(items: List[Dict[str, Any]]):
         out.append({"videoId": vid, "title": it.get("title")})
     _save_list(FAVS_PATH, out)
 
-# ---------- yt-dlp adapters (sync) ----------
+# ---------- yt-dlp adapters ----------
 def _build_local_cmd(url: str) -> list[str]:
-    # Compose: <YTDLP_CMD> <url> --dump-json --no-warnings [--cookies file] [--sponsorblock-mark all]
     cmd = [YTDLP_CMD, url, "--dump-json", "--no-warnings"]
     if COOKIES:
         cmd += ["--cookies", COOKIES]
@@ -107,10 +106,6 @@ def _build_local_cmd(url: str) -> list[str]:
     return cmd
 
 def _remote_ytdlp_dump(url: str) -> dict:
-    """
-    Expect a remote endpoint that returns the raw JSON of `yt-dlp -J <url>`.
-    Default contract: GET {YTDLP_REMOTE_URL}?url=<url>[&cookies=...&sponsorblock=all]
-    """
     if not YTDLP_REMOTE_URL:
         raise HTTPException(500, "YTDLP_REMOTE_URL not set for remote mode")
     q = {"url": url}
@@ -146,10 +141,6 @@ def _local_ytdlp_dump(url: str) -> dict:
         raise HTTPException(502, "Failed to parse yt-dlp JSON")
 
 def ytdlp_dump(video_id: str) -> dict:
-    """
-    Cached JSON probe equivalent to `yt-dlp -J`.
-    Uses Redis and supports either local binary or remote service (sync).
-    """
     ck = f"ytdlp:video:{video_id}"
     cached = cache_get(ck)
     if cached:
@@ -167,150 +158,442 @@ def ytdlp_dump(video_id: str) -> dict:
         pass
     return info
 
-# ---------- stream selection ----------
-def pick_stream(info: dict, policy: str = "h264_mp4") -> dict:
-    formats = info.get("formats") or []
+# ---------- format helpers ----------
+def _fmt_is_video_only(f: dict) -> bool:
+    v = (f.get("vcodec") or "").lower()
+    a = (f.get("acodec") or "").lower()
+    return (v not in ("", "none")) and (a in ("", "none"))
+
+def _fmt_is_audio_only(f: dict) -> bool:
+    # Be tolerant: if there's no video and either acodec is present OR
+    # there are clear audio hints (abr/asr/audio_channels) or typical audio ext.
+    v = (f.get("vcodec") or "").lower()
+    a = (f.get("acodec") or "").lower()
+    ext = (f.get("ext") or "").lower()
+    audioish = (
+        (a not in ("", "none"))
+        or ext in ("m4a", "webm", "mp3", "opus")
+        or bool(f.get("abr")) or bool(f.get("asr")) or bool(f.get("audio_channels"))
+    )
+    return (v in ("", "none")) and audioish
+
+def _fmt_is_muxed(f: dict) -> bool:
+    v = (f.get("vcodec") or "").lower()
+    a = (f.get("acodec") or "").lower()
+    return (v not in ("", "none")) and (a not in ("", "none"))
+
+def _is_mp4_audio(f: dict) -> bool:
+    a = (f.get("acodec") or "").lower()
+    ext = (f.get("ext") or "").lower()
+    return ("mp4a" in a) or ("aac" in a) or (ext == "m4a")
+
+def _best_audio(fmts: list[dict]) -> dict | None:
+    """Return the best audio *source* dict.
+    Prefer real audio-only; if none exist, fall back to a muxed stream (e.g., itag 18) to borrow its audio.
+    """
+    # First: true audio-only candidates
+    auds = [f for f in fmts if _fmt_is_audio_only(f) and f.get("url")]
+    if auds:
+        return max(
+            auds,
+            key=lambda f: (1 if _is_mp4_audio(f) else 0, f.get("abr") or 0, f.get("tbr") or 0)
+        )
+
+    # Fallback: any muxed (has audio+video). We'll map only the audio stream in ffmpeg.
+    muxeds = [f for f in fmts if _fmt_is_muxed(f) and f.get("url")]
+    if muxeds:
+        def score(f):
+            ext = (f.get("ext") or f.get("container") or "").lower()
+            a = (f.get("acodec") or "").lower()
+            # Prefer mp4 container and AAC audio, then higher tbr as a loose proxy for quality
+            mp4ish = 1 if (ext == "mp4") else 0
+            aacish = 1 if (("mp4a" in a) or ("aac" in a)) else 0
+            return (mp4ish + aacish, f.get("tbr") or 0)
+        return max(muxeds, key=score)
+
+    return None
+
+def _map_formats(info: dict):
+    out = []
+    for f in info.get("formats") or []:
+        if not f.get("url"):
+            continue
+        fid = str(f.get("format_id") or f.get("itag") or "")
+        if fid.startswith("sb"):  # drop storyboard entries
+            continue
+        has_v = _fmt_is_video_only(f) or _fmt_is_muxed(f)
+        has_a = _fmt_is_audio_only(f) or _fmt_is_muxed(f)
+        out.append({
+            "itag": fid,
+            "ext": f.get("ext") or f.get("container"),
+            "vcodec": f.get("vcodec") or "none",
+            "acodec": f.get("acodec") or "none",
+            "height": f.get("height"),
+            "tbr": f.get("tbr"),
+            "quality_label": f.get("quality_label") or f.get("format_note"),
+            "has_video": has_v,
+            "has_audio": has_a,
+        })
+    return out
+
+
+# ---------- selection ----------
+def pick_stream(info: dict, policy: str = "h264_mp4") -> dict | None:
+    fmts = info.get("formats") or []
     best = None
 
-    # h264 mp4 first
     if policy == "h264_mp4":
-        mp4s = [f for f in formats
-                if (f.get("container") == "mp4" or f.get("ext") == "mp4")
-                and f.get("acodec") not in (None, "none")
-                and f.get("vcodec") not in (None, "none")
-                and f.get("url")]
+        mp4s = [f for f in fmts if (f.get("container") == "mp4" or f.get("ext") == "mp4")
+                and _fmt_is_muxed(f) and f.get("url")]
         if mp4s:
             best = max(mp4s, key=lambda f: f.get("tbr") or 0)
 
-    # best overall muxed
-    if (policy == "best") or not best:
-        muxed = [f for f in formats
-                 if f.get("acodec") not in (None, "none")
-                 and f.get("vcodec") not in (None, "none")
-                 and f.get("url")]
+    if not best:
+        muxed = [f for f in fmts if _fmt_is_muxed(f) and f.get("url")]
         if muxed:
             best = max(muxed, key=lambda f: f.get("tbr") or 0)
 
-    # fallback to top-level URL
-    if not best and info.get("url"):
-        best = {"url": info["url"], "ext": info.get("ext"), "container": info.get("container"),
-                "vcodec": info.get("vcodec"), "acodec": info.get("acodec")}
-
-    if not best or not best.get("url"):
-        raise HTTPException(status_code=502, detail="No playable stream found")
+    if not best:
+        return None
 
     container = best.get("container") or best.get("ext") or "mp4"
     v = best.get("vcodec") or ""
     a = best.get("acodec") or ""
-    return {"url": best["url"], "container": container, "codecs": f"{v}+{a}".strip("+")}
+    return {"kind": "muxed", "url": best["url"], "container": container, "codecs": f"{v}+{a}".strip("+")}
 
-def _fmt_is_video_only(f): return (f.get("vcodec") not in (None, "none")) and (f.get("acodec") in (None, "none"))
-def _fmt_is_audio_only(f): return (f.get("acodec") not in (None, "none")) and (f.get("vcodec") in (None, "none"))
-def _fmt_is_muxed(f):     return (f.get("vcodec") not in (None, "none")) and (f.get("acodec") not in (None, "none"))
-
-def _pick_split_streams(info: dict, prefer_h264=True):
-    vids, auds = [], []
-    for f in info.get("formats") or []:
-        if not f.get("url"):
-            continue
-        if _fmt_is_video_only(f): vids.append(f)
-        if _fmt_is_audio_only(f): auds.append(f)
-    if not vids or not auds:
-        return None, None
-
-    def score_v(f):
-        base = (f.get("tbr") or 0) + (f.get("height") or 0) * 5
-        if prefer_h264 and isinstance(f.get("vcodec"), str) and "avc" in f["vcodec"]:
-            base += 100000
-        if f.get("ext") == "mp4": base += 5000
-        return base
-
-    def score_a(f):
-        base = (f.get("tbr") or 0)
-        if isinstance(f.get("acodec"), str) and ("mp4a" in f["acodec"] or "aac" in f["acodec"]):
-            base += 5000
-        if f.get("ext") == "m4a": base += 2000
-        return base
-
-    v_best = max(vids, key=score_v)
-    a_best = max(auds, key=score_a)
-    return v_best.get("url"), a_best.get("url")
-
-def _pick_by_itag(info: dict, itag: str) -> dict | None:
+def _pick_by_itag(info: dict, itag: str | None) -> dict | None:
     if not itag:
         return None
-
     fmts = info.get("formats") or []
-    target = next((f for f in fmts if str(f.get("format_id")) == str(itag) and f.get("url")), None)
+    target = next((f for f in fmts
+                   if str(f.get("format_id") or f.get("itag")) == str(itag) and f.get("url")), None)
     if not target:
         return None
 
-    # muxed → direct
+    # Muxed → direct
     if _fmt_is_muxed(target):
         container = target.get("container") or target.get("ext") or "mp4"
         v = target.get("vcodec") or ""
         a = target.get("acodec") or ""
-        return {"url": target["url"], "container": container, "codecs": f"{v}+{a}".strip("+")}
+        return {"kind": "muxed", "url": target["url"], "container": container, "codecs": f"{v}+{a}".strip("+")}
 
-    # video-only → pair with best audio-only
+    # Video-only → pair with best audio (audio-only preferred; else borrow audio from muxed)
     if _fmt_is_video_only(target):
-        v_url = target.get("url")
-        a_candidates = [f for f in fmts if _fmt_is_audio_only(f) and f.get("url")]
-        a_candidates.sort(
-            key=lambda f: (
-                f.get("tbr") or f.get("abr") or 0,
-                1 if ("mp4a" in str(f.get("acodec", "")) or "aac" in str(f.get("acodec", ""))) else 0,
-                1 if f.get("ext") == "m4a" else 0,
-            ),
-            reverse=True,
-        )
-        a_url = a_candidates[0]["url"] if a_candidates else None
-        if v_url and a_url:
-            return {"video_url": v_url, "audio_url": a_url, "container": "mp4", "codecs": "split"}
+        abest = _best_audio(fmts)
+        if abest:
+            return {"kind": "split", "container": "mp4", "video_url": target["url"], "audio_url": abest["url"]}
+        return None
 
-    # audio-only → pair with best video-only
+    # Audio-only → pair with best video-only
     if _fmt_is_audio_only(target):
-        a_url = target.get("url")
-        v_candidates = [f for f in fmts if _fmt_is_video_only(f) and f.get("url")]
-        v_candidates.sort(
-            key=lambda f: (
-                f.get("height") or 0,
-                f.get("tbr") or 0,
-                1 if "avc" in str(f.get("vcodec", "")) else 0,   # prefer h264/avc
-                1 if f.get("ext") == "mp4" else 0,
-            ),
-            reverse=True,
-        )
-        v_url = v_candidates[0]["url"] if v_candidates else None
-        if v_url and a_url:
-            return {"video_url": v_url, "audio_url": a_url, "container": "mp4", "codecs": "split"}
+        vids = [f for f in fmts if _fmt_is_video_only(f) and f.get("url")]
+        if vids:
+            vbest = max(vids, key=lambda f: ((f.get("height") or 0), (f.get("tbr") or 0)))
+            return {"kind": "split", "container": "mp4", "video_url": vbest["url"], "audio_url": target["url"]}
+        return None
 
     return None
 
-
-def _format_summary(f: dict) -> dict:
-    return {
-        "itag": f.get("format_id"),
-        "ext": f.get("ext"),
-        "container": f.get("container") or f.get("ext"),
-        "width": f.get("width"),
-        "height": f.get("height"),
-        "fps": f.get("fps"),
-        "tbr": f.get("tbr"),
-        "vcodec": f.get("vcodec"),
-        "acodec": f.get("acodec"),
-        "has_video": f.get("vcodec") not in (None, "none"),
-        "has_audio": f.get("acodec") not in (None, "none"),
-        "note": f.get("format_note")
-    }
-
+# ---------- HTTP helpers ----------
 async def backend_get(path: str, params: dict | None = None) -> httpx.Response:
     url = f"{BACKEND_BASE}{path}"
     async with httpx.AsyncClient(timeout=30) as cx:
         r = await cx.get(url, params=params)
         return r
 
-# ---------- Import/Export helpers ----------
+async def probe_headers(target_url: str, headers: Dict[str, str]):
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as cx:
+        return await cx.head(target_url, headers=headers)
+
+def _headers_kv(headers: dict) -> list[str]:
+    kv = []
+    for k, v in (headers or {}).items():
+        # each -headers arg takes CRLF-joined header lines
+        kv += ["-headers", f"{k}: {v}\r\n"]
+    return kv
+
+# ---------- Routes ----------
+@app.get("/healthz")
+async def healthz():
+    return JSONResponse({
+        "ok": True,
+        "ytdlp_mode": YTDLP_MODE,
+        "ytdlp_cmd": YTDLP_CMD,
+        "remote": YTDLP_REMOTE_URL or None,
+        "ffmpeg_cmd": FFMPEG_CMD,
+        "data_dir": DATA_DIR
+    })
+
+@app.get("/search")
+async def search(q: str, type: str = "video", page: int = 1, limit: int = 30):
+    type_map = {"video": "video", "channel": "channel", "playlist": "playlist"}
+    if type not in type_map:
+        raise HTTPException(400, "Invalid type")
+    if BACKEND_PROVIDER == "invidious":
+        r = await backend_get("/api/v1/search", {"q": q, "page": page, "type": type_map[type]})
+    elif BACKEND_PROVIDER == "piped":
+        r = await backend_get("/api/v1/search", {"q": q})
+    else:
+        raise HTTPException(500, "Unsupported BACKEND_PROVIDER")
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"Upstream search error: {r.text[:200]}")
+    data = r.json()
+    if isinstance(data, list):
+        data = data[:limit]
+    return JSONResponse(data)
+
+@app.get("/channel/{channel_id}")
+async def channel(channel_id: str, page: int = 1):
+    if BACKEND_PROVIDER == "invidious":
+        r = await backend_get(f"/api/v1/channels/{channel_id}/videos", {"page": page})
+    elif BACKEND_PROVIDER == "piped":
+        r = await backend_get(f"/api/v1/channel/{channel_id}")
+    else:
+        raise HTTPException(500, "Unsupported BACKEND_PROVIDER")
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"Upstream channel error: {r.text[:200]}")
+    return JSONResponse(r.json())
+
+@app.get("/item/{video_id}")
+async def item(video_id: str):
+    ckey = f"meta:item:{video_id}"
+    cached = cache_get(ckey)
+    if cached:
+        try:
+            return JSONResponse(json.loads(cached))
+        except Exception:
+            pass
+
+    if BACKEND_PROVIDER == "invidious":
+        r = await backend_get(f"/api/v1/videos/{video_id}")
+    elif BACKEND_PROVIDER == "piped":
+        r = await backend_get(f"/api/v1/video/{video_id}")
+    else:
+        raise HTTPException(500, "Unsupported BACKEND_PROVIDER")
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"Upstream item error: {r.text[:200]}")
+    meta = r.json()
+
+    # Enrich with yt-dlp data (chapters, subs, thumbs, duration)
+    try:
+        info = ytdlp_dump(video_id)
+        meta["chapters"]  = info.get("chapters") or []
+        meta["subtitles"] = info.get("subtitles") or {}
+        meta["duration"]  = info.get("duration") or meta.get("lengthSeconds")
+        thumbs = info.get("thumbnails") or []
+        if thumbs:
+            meta["thumbnails"] = thumbs
+    except HTTPException:
+        pass
+
+    try:
+        cache_set(ckey, json.dumps(meta))
+    except Exception:
+        pass
+    return JSONResponse(meta)
+
+@app.get("/formats/{video_id}")
+def list_formats(video_id: str):
+    info = ytdlp_dump(video_id)
+    fmts = _map_formats(info)
+    # sort: videos by (height, tbr), then audios by tbr
+    fmts.sort(
+        key=lambda x: (1 if x.get("has_video") else 0, x.get("height") or 0, x.get("tbr") or 0),
+        reverse=True
+    )
+    return {"id": video_id, "title": info.get("title"), "formats": fmts}
+
+@app.get("/resolve")
+async def resolve(video_id: str, policy: str = "h264_mp4", itag: str | None = None):
+    info = ytdlp_dump(video_id)
+    stream = _pick_by_itag(info, itag) if itag else pick_stream(info, policy)
+    if not stream:
+        raise HTTPException(502, "No playable stream found")
+    payload = {
+        "id": video_id,
+        "title": info.get("title"),
+        "duration": info.get("duration"),
+        "thumbnails": info.get("thumbnails"),
+        "chapters": info.get("chapters") or [],
+        "subtitles": info.get("subtitles") or {},
+        **stream
+    }
+    return JSONResponse(payload)
+
+@app.get("/play/{video_id}")
+async def play(video_id: str, request: Request, policy: str = "h264_mp4", itag: str | None = None):
+    info = ytdlp_dump(video_id)
+    stream = _pick_by_itag(info, itag) if itag else pick_stream(info, policy)
+    if not stream:
+        raise HTTPException(502, "No playable stream (progressive or split) found")
+
+    # Progressive (muxed) → proxy with ranges
+    if stream.get("kind") == "muxed" and "url" in stream:
+        target = stream["url"]
+        headers = {}
+        if request.headers.get("Range"): headers["Range"] = request.headers["Range"]
+        if request.headers.get("If-Range"): headers["If-Range"] = request.headers["If-Range"]
+
+        async def generator(target_url):
+            async with httpx.AsyncClient(timeout=None, follow_redirects=True) as cx:
+                async with cx.stream("GET", target_url, headers=headers) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+
+        # best-effort upstream HEAD to mirror headers
+        try:
+            hr = await probe_headers(target, headers)
+        except Exception:
+            hr = None
+
+        # If expired/403, re-probe once
+        if hr is not None and hr.status_code in (403, 410):
+            info2 = ytdlp_dump(video_id)
+            stream2 = _pick_by_itag(info2, itag) if itag else pick_stream(info2, policy)
+            if stream2 and stream2.get("kind") == "muxed" and "url" in stream2:
+                target = stream2["url"]
+                try:
+                    hr = await probe_headers(target, headers)
+                except Exception:
+                    hr = None
+
+        resp_headers, status = {}, 200
+        if hr is not None:
+            status = 206 if headers.get("Range") and hr.status_code in (200, 206) else 200
+            for h in ["Content-Type", "Content-Length", "Accept-Ranges", "Content-Range", "Last-Modified", "ETag"]:
+                if h in hr.headers:
+                    resp_headers[h] = hr.headers[h]
+
+        return StreamingResponse(generator(target), status_code=status, headers=resp_headers)
+
+    # Split (video-only + audio-only) → live remux (no ranges)
+    if stream.get("kind") == "split" and stream.get("video_url") and stream.get("audio_url"):
+        v = stream["video_url"]
+        a = stream["audio_url"]
+
+        # Use yt-dlp's suggested headers (User-Agent, Accept-Language, etc.) for BOTH inputs
+        yt_hdrs = info.get("http_headers") or {}
+
+        cmd = [
+            FFMPEG_CMD, "-loglevel", "error", "-nostdin", "-hide_banner",
+            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+            "-rw_timeout", "15000000",
+            # video input + headers (must precede -i)
+            *(_headers_kv(yt_hdrs)), "-i", v,
+            # audio input + headers
+            *(_headers_kv(yt_hdrs)), "-i", a,
+            "-c", "copy",
+            "-movflags", "+frag_keyframe+empty_moov",
+            "-f", "mp4", "pipe:1",
+        ]
+
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        except FileNotFoundError:
+            raise HTTPException(500, f"ffmpeg not found at '{FFMPEG_CMD}'. Set FFMPEG_CMD or install ffmpeg.")
+
+        async def gen():
+            try:
+                while True:
+                    chunk = proc.stdout.read(64 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                try:
+                    # surface ffmpeg errors if it died unexpectedly
+                    rc = proc.poll()
+                    if rc not in (0, None):
+                        try:
+                            err = (proc.stderr.read() or b"").decode("utf-8", "ignore")
+                        except Exception:
+                            err = ""
+                        raise HTTPException(status_code=502, detail=f"ffmpeg failed: {err.strip()[:500]}")
+                finally:
+                    try: proc.kill()
+                    except: pass
+
+        return StreamingResponse(gen(), media_type="video/mp4", headers={"Accept-Ranges": "none"})
+
+    raise HTTPException(502, "No playable stream (progressive or split) found")
+
+
+@app.head("/play/{video_id}")
+async def play_head(video_id: str, request: Request, policy: str = "h264_mp4", itag: str | None = None):
+    """Support HEAD (best effort). Split-remux returns generic headers."""
+    info = ytdlp_dump(video_id)
+    stream = _pick_by_itag(info, itag) if itag else pick_stream(info, policy)
+
+    # Progressive → proxy upstream headers
+    if stream and stream.get("kind") == "muxed" and "url" in stream:
+        target = stream["url"]
+        headers = {}
+        if request.headers.get("Range"): headers["Range"] = request.headers["Range"]
+        if request.headers.get("If-Range"): headers["If-Range"] = request.headers["If-Range"]
+        try:
+            hr = await probe_headers(target, headers)
+        except Exception:
+            hr = None
+        resp_headers, status = {}, 200
+        if hr is not None:
+            status = 206 if headers.get("Range") and hr.status_code in (200, 206) else 200
+            for h in ["Content-Type", "Content-Length", "Accept-Ranges", "Content-Range", "Last-Modified", "ETag"]:
+                if h in hr.headers:
+                    resp_headers[h] = hr.headers[h]
+        return Response(status_code=status, headers=resp_headers)
+
+    # Split remux: unknown size; generic OK
+    return Response(status_code=200, headers={"Content-Type": "video/mp4"})
+
+# ---------- Subscriptions / Favorites API ----------
+@app.get("/subscriptions", response_class=JSONResponse)
+def get_subscriptions():
+    return load_subscriptions()
+
+@app.get("/favorites", response_class=JSONResponse)
+def get_favorites():
+    return load_favorites()
+
+@app.post("/subscriptions/import")
+async def import_subscriptions(format: str = "auto", file: UploadFile = File(...)):
+    raw = (await file.read()).decode("utf-8", errors="ignore")
+    if format == "opml" or (format == "auto" and raw.lstrip().startswith("<")):
+        new_items = parse_opml_to_subs(raw)
+    else:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            raise HTTPException(400, "Invalid JSON")
+        new_items = parse_json_to_subs(obj)
+
+    if not new_items:
+        raise HTTPException(400, "No subscriptions found")
+    current = load_subscriptions()
+    merged = current + new_items
+    save_subscriptions(merged)
+    return {"imported": len(new_items), "total": len(load_subscriptions())}
+
+@app.get("/subscriptions/export")
+def export_subscriptions(format: str = "opml"):
+    subs = load_subscriptions()
+    if format == "opml":
+        text = _opml_for_subs(subs)
+        return Response(
+            content=text,
+            media_type="text/xml",
+            headers={"Content-Disposition": 'attachment; filename="jellytube_subscriptions.opml"'}
+        )
+    elif format in ("freetube", "json"):
+        payload = {"subscriptions": [{"channelId": s["channelId"], "name": s.get("title")} for s in subs]}
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        return Response(
+            content=text,
+            media_type="application/json",
+            headers={"Content-Disposition": 'attachment; filename="jellytube_subscriptions.json"'}
+        )
+    else:
+        raise HTTPException(400, "format must be opml|freetube|json")
+
 def _extract_channel_id_from_url(url: str) -> str | None:
     if not url:
         return None
@@ -402,283 +685,6 @@ def _opml_for_subs(subs: List[Dict[str, Any]]) -> str:
         lines.append(f'    <outline text="{title}" title="{title}" type="rss" xmlUrl="{xmlu}" htmlUrl="{html}" />')
     lines += ['  </body>', '</opml>']
     return "\n".join(lines)
-
-# ---------- Routes ----------
-@app.get("/healthz")
-async def healthz():
-    return JSONResponse({
-        "ok": True,
-        "ytdlp_mode": YTDLP_MODE,
-        "ytdlp_cmd": YTDLP_CMD,
-        "remote": YTDLP_REMOTE_URL or None,
-        "ffmpeg_cmd": FFMPEG_CMD,
-        "data_dir": DATA_DIR
-    })
-
-@app.get("/search")
-async def search(q: str, type: str = "video", page: int = 1, limit: int = 30):
-    type_map = {"video": "video", "channel": "channel", "playlist": "playlist"}
-    if type not in type_map:
-        raise HTTPException(400, "Invalid type")
-    if BACKEND_PROVIDER == "invidious":
-        r = await backend_get("/api/v1/search", {"q": q, "page": page, "type": type_map[type]})
-    elif BACKEND_PROVIDER == "piped":
-        r = await backend_get("/api/v1/search", {"q": q})
-    else:
-        raise HTTPException(500, "Unsupported BACKEND_PROVIDER")
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"Upstream search error: {r.text[:200]}")
-    data = r.json()
-    if isinstance(data, list):
-        data = data[:limit]
-    return JSONResponse(data)
-
-@app.get("/channel/{channel_id}")
-async def channel(channel_id: str, page: int = 1):
-    if BACKEND_PROVIDER == "invidious":
-        r = await backend_get(f"/api/v1/channels/{channel_id}/videos", {"page": page})
-    elif BACKEND_PROVIDER == "piped":
-        r = await backend_get(f"/api/v1/channel/{channel_id}")
-    else:
-        raise HTTPException(500, "Unsupported BACKEND_PROVIDER")
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"Upstream channel error: {r.text[:200]}")
-    return JSONResponse(r.json())
-
-@app.get("/playlist/{playlist_id}")
-async def playlist(playlist_id: str, page: int = 1):
-    if BACKEND_PROVIDER == "invidious":
-        r = await backend_get(f"/api/v1/playlists/{playlist_id}", {"page": page})
-    elif BACKEND_PROVIDER == "piped":
-        r = await backend_get(f"/api/v1/playlist/{playlist_id}")
-    else:
-        raise HTTPException(500, "Unsupported BACKEND_PROVIDER")
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"Upstream playlist error: {r.text[:200]}")
-    return JSONResponse(r.json())
-
-@app.get("/item/{video_id}")
-async def item(video_id: str):
-    ckey = f"meta:item:{video_id}"
-    cached = cache_get(ckey)
-    if cached:
-        try:
-            return JSONResponse(json.loads(cached))
-        except Exception:
-            pass
-
-    if BACKEND_PROVIDER == "invidious":
-        r = await backend_get(f"/api/v1/videos/{video_id}")
-    elif BACKEND_PROVIDER == "piped":
-        r = await backend_get(f"/api/v1/video/{video_id}")
-    else:
-        raise HTTPException(500, "Unsupported BACKEND_PROVIDER")
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"Upstream item error: {r.text[:200]}")
-    meta = r.json()
-
-    # Enrich with yt-dlp data (chapters, subs, thumbs, duration)
-    try:
-        info = ytdlp_dump(video_id)
-        meta["chapters"]  = info.get("chapters") or []
-        meta["subtitles"] = info.get("subtitles") or {}
-        meta["duration"]  = info.get("duration") or meta.get("lengthSeconds")
-        thumbs = info.get("thumbnails") or []
-        if thumbs:
-            meta["thumbnails"] = thumbs
-    except HTTPException:
-        pass
-
-    try:
-        cache_set(ckey, json.dumps(meta))
-    except Exception:
-        pass
-    return JSONResponse(meta)
-
-@app.get("/formats/{video_id}")
-def list_formats(video_id: str):
-    info = ytdlp_dump(video_id)
-    out = [_format_summary(f) for f in (info.get("formats") or []) if f.get("url")]
-    out.sort(key=lambda x: ((x.get("height") or 0), (x.get("tbr") or 0)), reverse=True)
-    return {"id": video_id, "title": info.get("title"), "formats": out}
-
-@app.get("/resolve")
-async def resolve(video_id: str, policy: str = "h264_mp4", itag: str | None = None):
-    info = ytdlp_dump(video_id)
-    stream = _pick_by_itag(info, itag) if itag else pick_stream(info, policy)
-    if not stream:
-        raise HTTPException(502, "No playable stream found")
-    payload = {
-        "id": video_id,
-        "title": info.get("title"),
-        "duration": info.get("duration"),
-        "thumbnails": info.get("thumbnails"),
-        "chapters": info.get("chapters") or [],
-        "subtitles": info.get("subtitles") or {},
-        **stream
-    }
-    return JSONResponse(payload)
-
-async def probe_headers(target_url, headers):
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as cx:
-        hr = await cx.head(target_url, headers=headers)
-    return hr
-
-@app.get("/play/{video_id}")
-async def play(video_id: str, request: Request, policy: str = "h264_mp4", itag: str | None = None):
-    info = ytdlp_dump(video_id)
-    stream = _pick_by_itag(info, itag) if itag else pick_stream(info, policy)
-
-    # Progressive single URL (fast path)
-    if "url" in stream:
-        target = stream["url"]
-        headers = {}
-        range_hdr = request.headers.get("Range")
-        if range_hdr:
-            headers["Range"] = range_hdr
-        if request.headers.get("If-Range"):
-            headers["If-Range"] = request.headers.get("If-Range")
-
-        async def generator(target_url):
-            async with httpx.AsyncClient(timeout=None, follow_redirects=True) as cx:
-                async with cx.stream("GET", target_url, headers=headers) as resp:
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
-
-        try:
-            hr = await probe_headers(target, headers)
-        except Exception:
-            hr = None
-
-        if hr is not None and hr.status_code in (403, 410):
-            info2 = ytdlp_dump(video_id)
-            stream2 = _pick_by_itag(info2, itag) if itag else pick_stream(info2, policy)
-            target = stream2.get("url", target)
-            try:
-                hr = await probe_headers(target, headers)
-            except Exception:
-                hr = None
-
-        resp_headers = {}
-        status = 200
-        if hr is not None:
-            status = 206 if range_hdr and hr.status_code in (200, 206) else 200
-            for h in ["Content-Type", "Content-Length", "Accept-Ranges", "Content-Range", "Last-Modified", "ETag"]:
-                if h in hr.headers:
-                    resp_headers[h] = hr.headers[h]
-
-        return StreamingResponse(generator(target), status_code=status, headers=resp_headers)
-
-    # Split fallback → live remux to MP4 (no seeking)
-    if "video_url" in stream and "audio_url" in stream:
-        v = stream["video_url"]; a = stream["audio_url"]
-        cmd = [
-            FFMPEG_CMD, "-loglevel", "error", "-nostdin", "-hide_banner",
-            "-i", v, "-i", a,
-            "-c", "copy",
-            "-movflags", "+frag_keyframe+empty_moov",
-            "-f", "mp4", "pipe:1"
-        ]
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-        except FileNotFoundError:
-            raise HTTPException(500, f"ffmpeg not found at '{FFMPEG_CMD}'. Set FFMPEG_CMD or install ffmpeg.")
-
-        async def gen():
-            try:
-                while True:
-                    chunk = proc.stdout.read(64 * 1024)
-                    if not chunk:
-                        break
-                    yield chunk
-            finally:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-        return StreamingResponse(gen(), media_type="video/mp4")
-
-    raise HTTPException(502, "No playable stream (progressive or split) found")
-
-@app.head("/play/{video_id}")
-async def play_head(video_id: str, request: Request, policy: str = "h264_mp4", itag: str | None = None):
-    """Support HEAD (best effort; split remux returns generic headers)."""
-    info = ytdlp_dump(video_id)
-    stream = _pick_by_itag(info, itag) if itag else pick_stream(info, policy)
-
-    # Progressive → proxy upstream headers
-    if "url" in stream:
-        target = stream["url"]
-        headers = {}
-        range_hdr = request.headers.get("Range")
-        if range_hdr:
-            headers["Range"] = range_hdr
-        if request.headers.get("If-Range"):
-            headers["If-Range"] = request.headers.get("If-Range")
-        try:
-            hr = await probe_headers(target, headers)
-        except Exception:
-            hr = None
-        resp_headers, status = {}, 200
-        if hr is not None:
-            status = 206 if range_hdr and hr.status_code in (200, 206) else 200
-            for h in ["Content-Type", "Content-Length", "Accept-Ranges", "Content-Range", "Last-Modified", "ETag"]:
-                if h in hr.headers:
-                    resp_headers[h] = hr.headers[h]
-        return Response(status_code=status, headers=resp_headers)
-
-    # Split remux (no size known)
-    return Response(status_code=200, headers={"Content-Type": "video/mp4"})
-
-# ---------- Subscriptions / Favorites API ----------
-@app.get("/subscriptions", response_class=JSONResponse)
-def get_subscriptions():
-    return load_subscriptions()
-
-@app.get("/favorites", response_class=JSONResponse)
-def get_favorites():
-    return load_favorites()
-
-@app.post("/subscriptions/import")
-async def import_subscriptions(format: str = "auto", file: UploadFile = File(...)):
-    raw = (await file.read()).decode("utf-8", errors="ignore")
-    if format == "opml" or (format == "auto" and raw.lstrip().startswith("<")):
-        new_items = parse_opml_to_subs(raw)
-    else:
-        try:
-            obj = json.loads(raw)
-        except Exception:
-            raise HTTPException(400, "Invalid JSON")
-        new_items = parse_json_to_subs(obj)
-
-    if not new_items:
-        raise HTTPException(400, "No subscriptions found")
-    current = load_subscriptions()
-    merged = current + new_items
-    save_subscriptions(merged)
-    return {"imported": len(new_items), "total": len(load_subscriptions())}
-
-@app.get("/subscriptions/export")
-def export_subscriptions(format: str = "opml"):
-    subs = load_subscriptions()
-    if format == "opml":
-        text = _opml_for_subs(subs)
-        return Response(
-            content=text,
-            media_type="text/xml",
-            headers={"Content-Disposition": 'attachment; filename="jellytube_subscriptions.opml"'}
-        )
-    elif format in ("freetube", "json"):
-        payload = {"subscriptions": [{"channelId": s["channelId"], "name": s.get("title")} for s in subs]}
-        text = json.dumps(payload, ensure_ascii=False, indent=2)
-        return Response(
-            content=text,
-            media_type="application/json",
-            headers={"Content-Disposition": 'attachment; filename="jellytube_subscriptions.json"'}
-        )
-    else:
-        raise HTTPException(400, "format must be opml|freetube|json")
 
 @app.post("/favorites/import")
 async def import_favorites(file: UploadFile = File(...)):
