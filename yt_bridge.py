@@ -30,7 +30,7 @@ pathlib.Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 SUBS_PATH = os.path.join(DATA_DIR, "subscriptions.json")
 FAVS_PATH = os.path.join(DATA_DIR, "favorites.json")
 
-app = FastAPI(title="ytbridge", version="0.7.0")
+app = FastAPI(title="ytbridge", version="0.7.1")
 rds = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 app.add_middleware(
     CORSMiddleware,
@@ -158,6 +158,29 @@ def ytdlp_dump(video_id: str) -> dict:
         pass
     return info
 
+# ---------- header helpers ----------
+def _yt_headers(info: dict) -> Dict[str, str]:
+    """Headers yt-dlp suggests for fetching media."""
+    hdrs = {}
+    src = info.get("http_headers") or {}
+    # Copy as-is (yt-dlp already excludes hop-by-hop headers)
+    for k, v in src.items():
+        if isinstance(k, str) and isinstance(v, str):
+            hdrs[k] = v
+    # Provide sane fallbacks if missing
+    hdrs.setdefault("User-Agent", "Mozilla/5.0")
+    hdrs.setdefault("Accept", "*/*")
+    hdrs.setdefault("Accept-Language", "en-US,en;q=0.9")
+    return hdrs
+
+def _merge(*ds: Dict[str, str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for d in ds:
+        for k, v in (d or {}).items():
+            if v is not None:
+                out[k] = v
+    return out
+
 # ---------- format helpers ----------
 def _fmt_is_video_only(f: dict) -> bool:
     v = (f.get("vcodec") or "").lower()
@@ -165,8 +188,6 @@ def _fmt_is_video_only(f: dict) -> bool:
     return (v not in ("", "none")) and (a in ("", "none"))
 
 def _fmt_is_audio_only(f: dict) -> bool:
-    # Be tolerant: if there's no video and either acodec is present OR
-    # there are clear audio hints (abr/asr/audio_channels) or typical audio ext.
     v = (f.get("vcodec") or "").lower()
     a = (f.get("acodec") or "").lower()
     ext = (f.get("ext") or "").lower()
@@ -188,29 +209,21 @@ def _is_mp4_audio(f: dict) -> bool:
     return ("mp4a" in a) or ("aac" in a) or (ext == "m4a")
 
 def _best_audio(fmts: list[dict]) -> dict | None:
-    """Return the best audio *source* dict.
-    Prefer real audio-only; if none exist, fall back to a muxed stream (e.g., itag 18) to borrow its audio.
-    """
-    # First: true audio-only candidates
     auds = [f for f in fmts if _fmt_is_audio_only(f) and f.get("url")]
     if auds:
         return max(
             auds,
             key=lambda f: (1 if _is_mp4_audio(f) else 0, f.get("abr") or 0, f.get("tbr") or 0)
         )
-
-    # Fallback: any muxed (has audio+video). We'll map only the audio stream in ffmpeg.
     muxeds = [f for f in fmts if _fmt_is_muxed(f) and f.get("url")]
     if muxeds:
         def score(f):
             ext = (f.get("ext") or f.get("container") or "").lower()
             a = (f.get("acodec") or "").lower()
-            # Prefer mp4 container and AAC audio, then higher tbr as a loose proxy for quality
             mp4ish = 1 if (ext == "mp4") else 0
             aacish = 1 if (("mp4a" in a) or ("aac" in a)) else 0
             return (mp4ish + aacish, f.get("tbr") or 0)
         return max(muxeds, key=score)
-
     return None
 
 def _map_formats(info: dict):
@@ -219,7 +232,7 @@ def _map_formats(info: dict):
         if not f.get("url"):
             continue
         fid = str(f.get("format_id") or f.get("itag") or "")
-        if fid.startswith("sb"):  # drop storyboard entries
+        if fid.startswith("sb"):  # storyboard entries
             continue
         has_v = _fmt_is_video_only(f) or _fmt_is_muxed(f)
         has_a = _fmt_is_audio_only(f) or _fmt_is_muxed(f)
@@ -236,26 +249,21 @@ def _map_formats(info: dict):
         })
     return out
 
-
 # ---------- selection ----------
 def pick_stream(info: dict, policy: str = "h264_mp4") -> dict | None:
     fmts = info.get("formats") or []
     best = None
-
     if policy == "h264_mp4":
         mp4s = [f for f in fmts if (f.get("container") == "mp4" or f.get("ext") == "mp4")
                 and _fmt_is_muxed(f) and f.get("url")]
         if mp4s:
             best = max(mp4s, key=lambda f: f.get("tbr") or 0)
-
     if not best:
         muxed = [f for f in fmts if _fmt_is_muxed(f) and f.get("url")]
         if muxed:
             best = max(muxed, key=lambda f: f.get("tbr") or 0)
-
     if not best:
         return None
-
     container = best.get("container") or best.get("ext") or "mp4"
     v = best.get("vcodec") or ""
     a = best.get("acodec") or ""
@@ -269,29 +277,22 @@ def _pick_by_itag(info: dict, itag: str | None) -> dict | None:
                    if str(f.get("format_id") or f.get("itag")) == str(itag) and f.get("url")), None)
     if not target:
         return None
-
-    # Muxed → direct
     if _fmt_is_muxed(target):
         container = target.get("container") or target.get("ext") or "mp4"
         v = target.get("vcodec") or ""
         a = target.get("acodec") or ""
         return {"kind": "muxed", "url": target["url"], "container": container, "codecs": f"{v}+{a}".strip("+")}
-
-    # Video-only → pair with best audio (audio-only preferred; else borrow audio from muxed)
     if _fmt_is_video_only(target):
         abest = _best_audio(fmts)
         if abest:
             return {"kind": "split", "container": "mp4", "video_url": target["url"], "audio_url": abest["url"]}
         return None
-
-    # Audio-only → pair with best video-only
     if _fmt_is_audio_only(target):
         vids = [f for f in fmts if _fmt_is_video_only(f) and f.get("url")]
         if vids:
             vbest = max(vids, key=lambda f: ((f.get("height") or 0), (f.get("tbr") or 0)))
             return {"kind": "split", "container": "mp4", "video_url": vbest["url"], "audio_url": target["url"]}
         return None
-
     return None
 
 # ---------- HTTP helpers ----------
@@ -308,20 +309,26 @@ async def probe_headers(target_url: str, headers: Dict[str, str]):
 def _headers_kv(headers: dict) -> list[str]:
     kv = []
     for k, v in (headers or {}).items():
-        # each -headers arg takes CRLF-joined header lines
         kv += ["-headers", f"{k}: {v}\r\n"]
     return kv
 
 # ---------- Routes ----------
 @app.get("/healthz")
 async def healthz():
+    cookies_meta = {"enabled": bool(COOKIES), "path": COOKIES or None, "size": None}
+    if COOKIES and os.path.exists(COOKIES):
+        try:
+            cookies_meta["size"] = os.path.getsize(COOKIES)
+        except Exception:
+            cookies_meta["size"] = None
     return JSONResponse({
         "ok": True,
         "ytdlp_mode": YTDLP_MODE,
         "ytdlp_cmd": YTDLP_CMD,
         "remote": YTDLP_REMOTE_URL or None,
         "ffmpeg_cmd": FFMPEG_CMD,
-        "data_dir": DATA_DIR
+        "data_dir": DATA_DIR,
+        "cookies": cookies_meta
     })
 
 @app.get("/search")
@@ -396,7 +403,6 @@ async def item(video_id: str):
 def list_formats(video_id: str):
     info = ytdlp_dump(video_id)
     fmts = _map_formats(info)
-    # sort: videos by (height, tbr), then audios by tbr
     fmts.sort(
         key=lambda x: (1 if x.get("has_video") else 0, x.get("height") or 0, x.get("tbr") or 0),
         reverse=True
@@ -430,57 +436,74 @@ async def play(video_id: str, request: Request, policy: str = "h264_mp4", itag: 
     # Progressive (muxed) → proxy with ranges
     if stream.get("kind") == "muxed" and "url" in stream:
         target = stream["url"]
-        headers = {}
-        if request.headers.get("Range"): headers["Range"] = request.headers["Range"]
-        if request.headers.get("If-Range"): headers["If-Range"] = request.headers["If-Range"]
 
-        async def generator(target_url):
+        passthru = {}
+        if request.headers.get("Range"):    passthru["Range"]    = request.headers["Range"]
+        if request.headers.get("If-Range"): passthru["If-Range"] = request.headers["If-Range"]
+        hdrs = _merge(_yt_headers(info), passthru)
+
+        async def generator(target_url: str, hdrs: Dict[str, str]):
             async with httpx.AsyncClient(timeout=None, follow_redirects=True) as cx:
-                async with cx.stream("GET", target_url, headers=headers) as resp:
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
+                attempt = 0
+                current_url = target_url
+                current_hdrs = hdrs
+                while True:
+                    async with cx.stream("GET", current_url, headers=current_hdrs) as resp:
+                        # If expired/forbidden, refresh once via yt-dlp
+                        if resp.status_code in (403, 410) and attempt == 0:
+                            attempt += 1
+                            info3 = ytdlp_dump(video_id)
+                            stream3 = _pick_by_itag(info3, itag) if itag else pick_stream(info3, policy)
+                            if not (stream3 and stream3.get("kind") == "muxed" and "url" in stream3):
+                                raise HTTPException(502, f"Upstream refused playback ({resp.status_code})")
+                            current_url = stream3["url"]
+                            current_hdrs = _merge(_yt_headers(info3), passthru)
+                            continue
+                        if resp.status_code not in (200, 206):
+                            raise HTTPException(resp.status_code, f"upstream status {resp.status_code}")
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+                        break  # normal EOF
 
-        # best-effort upstream HEAD to mirror headers
+        # Try an upstream HEAD to mirror useful headers
         try:
-            hr = await probe_headers(target, headers)
+            hr = await probe_headers(target, hdrs)
         except Exception:
             hr = None
 
-        # If expired/403, re-probe once
+        # If expired, refresh once for header probe too
         if hr is not None and hr.status_code in (403, 410):
             info2 = ytdlp_dump(video_id)
             stream2 = _pick_by_itag(info2, itag) if itag else pick_stream(info2, policy)
             if stream2 and stream2.get("kind") == "muxed" and "url" in stream2:
                 target = stream2["url"]
+                hdrs = _merge(_yt_headers(info2), passthru)
                 try:
-                    hr = await probe_headers(target, headers)
+                    hr = await probe_headers(target, hdrs)
                 except Exception:
                     hr = None
 
         resp_headers, status = {}, 200
         if hr is not None:
-            status = 206 if headers.get("Range") and hr.status_code in (200, 206) else 200
+            status = 206 if hdrs.get("Range") and hr.status_code in (200, 206) else 200
             for h in ["Content-Type", "Content-Length", "Accept-Ranges", "Content-Range", "Last-Modified", "ETag"]:
                 if h in hr.headers:
                     resp_headers[h] = hr.headers[h]
+        resp_headers.setdefault("Accept-Ranges", "bytes")
 
-        return StreamingResponse(generator(target), status_code=status, headers=resp_headers)
+        return StreamingResponse(generator(target, hdrs), status_code=status, headers=resp_headers)
 
     # Split (video-only + audio-only) → live remux (no ranges)
     if stream.get("kind") == "split" and stream.get("video_url") and stream.get("audio_url"):
         v = stream["video_url"]
         a = stream["audio_url"]
 
-        # Use yt-dlp's suggested headers (User-Agent, Accept-Language, etc.) for BOTH inputs
-        yt_hdrs = info.get("http_headers") or {}
-
+        yt_hdrs = _yt_headers(info)
         cmd = [
             FFMPEG_CMD, "-loglevel", "error", "-nostdin", "-hide_banner",
             "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
             "-rw_timeout", "15000000",
-            # video input + headers (must precede -i)
             *(_headers_kv(yt_hdrs)), "-i", v,
-            # audio input + headers
             *(_headers_kv(yt_hdrs)), "-i", a,
             "-c", "copy",
             "-movflags", "+frag_keyframe+empty_moov",
@@ -501,7 +524,6 @@ async def play(video_id: str, request: Request, policy: str = "h264_mp4", itag: 
                     yield chunk
             finally:
                 try:
-                    # surface ffmpeg errors if it died unexpectedly
                     rc = proc.poll()
                     if rc not in (0, None):
                         try:
@@ -517,29 +539,48 @@ async def play(video_id: str, request: Request, policy: str = "h264_mp4", itag: 
 
     raise HTTPException(502, "No playable stream (progressive or split) found")
 
-
 @app.head("/play/{video_id}")
 async def play_head(video_id: str, request: Request, policy: str = "h264_mp4", itag: str | None = None):
     """Support HEAD (best effort). Split-remux returns generic headers."""
     info = ytdlp_dump(video_id)
     stream = _pick_by_itag(info, itag) if itag else pick_stream(info, policy)
 
-    # Progressive → proxy upstream headers
+    # Progressive → proxy upstream headers (fallback to tiny GET if needed)
     if stream and stream.get("kind") == "muxed" and "url" in stream:
-        target = stream["url"]
-        headers = {}
-        if request.headers.get("Range"): headers["Range"] = request.headers["Range"]
-        if request.headers.get("If-Range"): headers["If-Range"] = request.headers["If-Range"]
+        target  = stream["url"]
+        yt_hdrs = _yt_headers(info)
+        passthru = {}
+        if request.headers.get("Range"):    passthru["Range"]    = request.headers["Range"]
+        if request.headers.get("If-Range"): passthru["If-Range"] = request.headers["If-Range"]
+        headers = _merge(yt_hdrs, passthru)
+
+        hr = None
         try:
             hr = await probe_headers(target, headers)
         except Exception:
             hr = None
+
+        # Fallback: some hosts omit Content-Range on HEAD, use a tiny ranged GET
+        if headers.get("Range") and (hr is None or ("Content-Range" not in hr.headers)):
+            try:
+                async with httpx.AsyncClient(timeout=15, follow_redirects=True) as cx:
+                    async with cx.stream("GET", target, headers=headers) as gr:
+                        await gr.aclose()
+                        class _H:
+                            status_code = gr.status_code
+                            headers = gr.headers
+                        hr = _H
+            except Exception:
+                pass
+
         resp_headers, status = {}, 200
         if hr is not None:
-            status = 206 if headers.get("Range") and hr.status_code in (200, 206) else 200
+            if headers.get("Range") and (hr.status_code in (200, 206)):
+                status = 206 if ("Content-Range" in hr.headers) else 200
             for h in ["Content-Type", "Content-Length", "Accept-Ranges", "Content-Range", "Last-Modified", "ETag"]:
                 if h in hr.headers:
                     resp_headers[h] = hr.headers[h]
+        resp_headers.setdefault("Accept-Ranges", "bytes")
         return Response(status_code=status, headers=resp_headers)
 
     # Split remux: unknown size; generic OK
