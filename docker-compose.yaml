@@ -9,22 +9,25 @@ services:
       - BACKEND_PROVIDER=${BACKEND_PROVIDER:-invidious}
       - BACKEND_BASE=${BACKEND_BASE:-https://yewtu.be}
       - YTDLP_MODE=${YTDLP_MODE:-local}
-      - YTDLP_CMD=${YTDLP_CMD:-/usr/local/bin/yt-dlp}
-      - YTDLP_REMOTE_URL=${YTDLP_REMOTE_URL:-}
-      - YTDLP_COOKIES=${YTDLP_COOKIES:-}
+      # Point to your mounted host binary (see volume below)
+      - YTDLP_CMD=${YTDLP_CMD:-/usr/local/bin/yt-dlp_linux}
+      # Use your original cookies path if you used it before, or leave empty
+      - YTDLP_COOKIES=${YTDLP_COOKIES:-/app/cookies.txt}
       - SPONSORBLOCK=${SPONSORBLOCK:-true}
       - PORT=${PORT:-8080}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - REDIS_TTL=${REDIS_TTL:-43200}
       - FFMPEG_CMD=${FFMPEG_CMD:-ffmpeg}
-      - DATA_DIR=${DATA_DIR:-/app/priv/data}
+      - DATA_DIR=${DATA_DIR:-/data}
     volumes:
-      # Optional: mount local src for live dev (comment for production)
+      # Code (optional live mount)
       - ./src:/app/src:ro
-      # Persist cookies/subscriptions/favorites
-      - ./priv:/app/priv
-      # Optional: provide a custom yt-dlp binary
-      # - ~/.yt-dlp/bin/yt-dlp_linux:/usr/local/bin/yt-dlp:ro
+      # Match your original data dir
+      - ./data:/data
+      # Mount your cookies exactly where YTDLP_COOKIES points (optional)
+      - ./cookies.txt:/app/cookies.txt:ro
+      # Mount your custom yt-dlp host binary exactly where YTDLP_CMD points
+      - ~/.yt-dlp/bin/yt-dlp_linux:/usr/local/bin/yt-dlp_linux
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
     depends_on:
