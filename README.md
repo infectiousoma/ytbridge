@@ -10,6 +10,7 @@ A tiny HTTP service that lets a Jellyfin plugin (or any client) **search/browse*
 - **Resolve Playback** via `yt-dlp` (`/resolve`), with optional `/play` proxy that supports **HTTP Range** for reliable seeking/transcoding.
 - **SponsorBlock** chapter marks (optional).
 - Pass-through **subtitles** and **chapters** from yt-dlp.
+- **Favorites** and **Subscriptions** import/export (JSON, OPML, FreeTube formats).
 - Simple, environment-only configuration.
 
 ---
@@ -20,28 +21,31 @@ A tiny HTTP service that lets a Jellyfin plugin (or any client) **search/browse*
 Jellyfin Plugin  ──(HTTP)──>  ytbridge (this service)
    Search/List                  ├─ talks to Invidious/Piped for metadata
    Playback                     └─ runs yt-dlp to get clean media URLs (or proxies)
+   Favorites/Subs                └─ JSON/OPML files stored in priv/data/
 ```
-
-Use **Invidious/Piped** for *find/describe*; use **yt-dlp** for *play/resolve*.
 
 ---
 
 ## Endpoints
 
-- `GET /search?q=QUERY&limit=50&type=video|channel|playlist&page=1`
-  - Uses Invidious or Piped. Returns normalized JSON from the upstream API.
-- `GET /channel/{channel_id}?page=1`
-  - Lists channel videos.
-- `GET /playlist/{playlist_id}?page=1`
-  - Lists playlist items.
-- `GET /item/{video_id}`
-  - Video metadata from Invidious/Piped. (Optionally enriched with yt-dlp chapters/subtitles if available.)
-- `GET /resolve?video_id={ID}&policy=h264_mp4`
-  - Runs yt-dlp to select a playable stream per policy; returns JSON including `url`, `container`, `codecs`, `duration`, `thumbnails`, `chapters`, `subtitles`.
-- `GET /play/{video_id}?policy=h264_mp4`
-  - **Proxy**: Streams bytes from resolved URL with **Accept-Ranges** support. Recommended for Jellyfin clients.
-- `GET /healthz`
-  - Liveness probe.
+- **Core**
+  - `GET /search?q=QUERY&limit=50&type=video|channel|playlist&page=1`
+  - `GET /channel/{channel_id}?page=1`
+  - `GET /item/{video_id}`
+  - `GET /formats/{video_id}`
+  - `GET /resolve?video_id={ID}&policy=h264_mp4`
+  - `GET /play/{video_id}?policy=h264_mp4`
+  - `HEAD /play/{video_id}`
+  - `GET /healthz`
+- **Subscriptions**
+  - `GET /subscriptions`
+  - `POST /subscriptions/import` (accepts JSON/OPML)
+  - `GET /subscriptions/export?format=opml|json|freetube`
+- **Favorites**
+  - `GET /favorites`
+  - `POST /favorites/import`
+  - `GET /favorites/export`
+  - `POST /favorites/add`
 
 ---
 
@@ -60,44 +64,68 @@ You can extend `pick_stream()` to add more (e.g., VP9/Opus, AV1).
 |---|---|---|
 | `BACKEND_PROVIDER` | `invidious` | One of `invidious` or `piped`. |
 | `BACKEND_BASE` | `https://yewtu.be` | Base URL of your Invidious/Piped instance. |
-| `YTDLP_COOKIES` | *(empty)* | Path to a cookies.txt file for age-gated content. Optional. |
-| `SPONSORBLOCK` | `true` | `"true"` to add SponsorBlock chapter marks (`--sponsorblock-mark all`). |
+| `YTDLP_MODE` | `local` | `"local"` or `"remote"` yt-dlp mode. |
+| `YTDLP_CMD` | `yt-dlp` | Path to yt-dlp binary (if local mode). |
+| `YTDLP_REMOTE_URL` | *(empty)* | URL of remote yt-dlp service (if remote mode). |
+| `YTDLP_COOKIES` | *(empty)* | Path to a cookies.txt file for age-gated content. |
+| `SPONSORBLOCK` | `true` | `"true"` to add SponsorBlock marks. |
 | `PORT` | `8080` | HTTP port for this service. |
-| `REDIS_URL` | `redis://redis:6379/0` | Redis URL for caching (optional but recommended). |
-| `REDIS_TTL` | `43200` | Cache TTL in seconds (default 12h). |
+| `REDIS_URL` | `redis://redis:6379/0` | Redis URL for caching. |
+| `REDIS_TTL` | `43200` | Cache TTL in seconds (12h). |
+| `DATA_DIR` | `/app/priv/data` | Directory for subscriptions/favorites JSON. |
+| `FFMPEG_CMD` | `ffmpeg` | Path to ffmpeg binary for live remux. |
 
-**Tip:** Self-host Invidious or Piped for reliability, or point to a public instance you trust.
+---
+
+## Project Layout
+
+```
+ytbridge-refactor/
+├── Dockerfile
+├── docker-compose.yaml
+├── README.md
+├── src/
+│   ├── ytbridge.py        # main FastAPI app
+│   ├── cache.py
+│   ├── config.py
+│   ├── favorites.py
+│   ├── subscriptions.py
+│   ├── ytdlp.py
+│   ├── formats.py
+│   ├── routes.py
+│   └── utils.py
+└── priv/
+    ├── cookies.txt        # optional
+    └── data/
+        ├── favorites.json
+        └── subscriptions.json
+```
 
 ---
 
 ## Quick Start
 
-### 1) Download the files
-
-- `README.md`
-- `app.py`
-- `docker-compose.yml`
-- `.env.example`
-
-### 2) (Optional) Self-host Invidious (or Piped)
-If you prefer local metadata/search, deploy your own Invidious/Piped and put its URL into `.env` (see below).
-
-### 3) Configure `.env`
-
-Copy the example and edit if needed:
+### 1) Clone & build
 
 ```bash
-cp .env.example .env
-# then edit .env to set BACKEND_BASE to your Invidious/Piped URL
-```
-
-### 4) Launch
-
-```bash
+git clone https://github.com/yourname/ytbridge
+cd ytbridge-refactor
 docker compose up -d --build
 ```
 
-The service will listen on the port you set (default **8080**).
+### 2) (Optional) Self-host Invidious/Piped
+
+Update `BACKEND_BASE` in your `.env` or `docker-compose.yaml`.
+
+### 3) Mount cookies / persist data
+
+Bind-mount `./priv:/app/priv` to persist JSON files and provide cookies.
+
+### 4) Check health
+
+```bash
+curl http://localhost:8080/healthz | jq .
+```
 
 ---
 
@@ -107,41 +135,39 @@ The service will listen on the port you set (default **8080**).
 # Search videos
 curl 'http://localhost:8080/search?q=lofi&type=video&limit=10'
 
-# Resolve a video to a direct playable URL
+# Resolve video
 curl 'http://localhost:8080/resolve?video_id=dQw4w9WgXcQ' | jq .
 
-# Proxy play (Jellyfin should use this URL as the media source)
+# Stream play
 curl -I 'http://localhost:8080/play/dQw4w9WgXcQ'
 
-# Channel listing
-curl 'http://localhost:8080/channel/UC-9-kyTW8ZkZNDHQJ6FgpwQ?page=1'
+# Export subscriptions
+curl 'http://localhost:8080/subscriptions/export?format=opml'
 
-# Health
-curl 'http://localhost:8080/healthz'
+# Add favorite
+curl -X POST -F "video_id=dQw4w9WgXcQ" -F "title=Never Gonna Give You Up" http://localhost:8080/favorites/add
 ```
 
 ---
 
-## Wiring to Jellyfin (plugin outline)
+## Jellyfin Integration
 
-In your Jellyfin plugin (.NET):
+In your Jellyfin plugin:
 
-- **Settings:** backend base URL (this service), preferred policy, followed channels/playlists, sync interval.
-- **Virtual Items:** call `/channel/:id`, `/playlist/:id`, or `/search` to build library items. Store `ProviderIds["YouTube"]=video_id` and thumbnail URL.
+- **Settings:** backend base URL (this service), preferred policy, channels/playlists, sync interval.
+- **Virtual Items:** call `/channel/:id`, `/playlist/:id`, or `/search` to build library items.
 - **Metadata Provider:** call `/item/:id` for overview, date, duration, thumbs.
-- **Stream Resolver:** call `/resolve` *or* directly set `Path="http://ytbridge:8080/play/{id}"` with `Protocol=Http`, `Container="mp4"`, `SupportsDirectPlay=true`.
-- **Chapters/Subtitles:** map from `/resolve` payload to `ChapterInfo` and `MediaStream` entries.
-
-This keeps Jellyfin “pure”: it never runs yt-dlp, never touches cookies, and doesn’t depend on public instances.
+- **Stream Resolver:** call `/resolve` *or* set `Path="http://ytbridge:8080/play/{id}"`.
+- **Chapters/Subtitles:** map from `/resolve` payload.
 
 ---
 
 ## Notes & Tips
 
-- **Caching:** For production, add a small cache around yt-dlp (e.g., Redis + TTL by `video_id`). The current app is stateless for clarity.
-- **Rate limiting:** Consider a simple token bucket (per-IP or global) to avoid upstream throttling.
-- **Geo/age restrictions:** Provide a cookies file and, if needed, proxy settings to yt-dlp.
-- **ToS:** Using YouTube outside their official API may violate their ToS. Use for personal/educational purposes at your discretion.
+- **Caching:** Redis recommended to avoid repeating yt-dlp calls.
+- **Cookies:** Put `cookies.txt` in `priv/` and set `YTDLP_COOKIES=/app/priv/cookies.txt`.
+- **Persistence:** Subscriptions/favorites stored in `priv/data/`.
+- **ToS:** This may violate YouTube ToS; use responsibly.
 
 ---
 
