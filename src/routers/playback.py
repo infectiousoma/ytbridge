@@ -1,3 +1,4 @@
+# routers/playback.py
 import subprocess
 from fastapi import APIRouter, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -26,7 +27,7 @@ async def play(video_id: str, request: Request, policy: str = "h264_mp4", itag: 
         if request.headers.get("If-Range"): passthru["If-Range"] = request.headers["If-Range"]
         hdrs = merge_headers(yt_headers(info), passthru)
 
-        async def generator(target_url: str, hdrs):
+        async def generator(target_url: str, hdrs: dict):
             async with httpx.AsyncClient(timeout=None, follow_redirects=True) as cx:
                 attempt = 0
                 current_url = target_url
@@ -42,8 +43,8 @@ async def play(video_id: str, request: Request, policy: str = "h264_mp4", itag: 
                                         info3 = ytdlp_dump(video_id)
                                         stream3 = pick_by_itag(info3, itag) if itag else pick_stream(info3, policy)
                                         if not (stream3 and stream3.get("kind") == "muxed" and "url" in stream3):
-                                            return  # stop quietly
-                                        current_url = stream3["url"]
+                                            return
+                                        current_url  = stream3["url"]
                                         current_hdrs = merge_headers(yt_headers(info3), passthru)
                                         continue
                                     except Exception:
@@ -55,14 +56,17 @@ async def play(video_id: str, request: Request, policy: str = "h264_mp4", itag: 
                                 yield chunk
                             break
                     except Exception:
+                        # Treat network hiccups as end-of-stream; Jellyfin will retry
                         return
 
         # Preflight HEAD for response headers; refresh once if needed
+        hr = None
         try:
             hr = await probe_headers(target, hdrs)
         except Exception:
             hr = None
 
+        # If the signed URL is stale, refresh once here as well (mirrors GET path)
         if hr is not None and hr.status_code in (403, 410):
             try:
                 info2 = ytdlp_dump(video_id)
@@ -75,6 +79,22 @@ async def play(video_id: str, request: Request, policy: str = "h264_mp4", itag: 
                     except Exception:
                         hr = None
             except Exception:
+                pass
+
+        # If HEAD wasn't helpful (many YT edges don’t include Content-Range on HEAD),
+        # do a tiny ranged GET to infer headers when the client asked for Range.
+        if hdrs.get("Range") and (hr is None or ("Content-Range" not in (hr.headers or {}))):
+            try:
+                async with httpx.AsyncClient(timeout=15, follow_redirects=True) as cx:
+                    async with cx.stream("GET", target, headers=hdrs) as gr:
+                        # Drop body; we only want headers/status
+                        await gr.aclose()
+                        class _H: ...
+                        _H.status_code = gr.status_code
+                        _H.headers = gr.headers
+                        hr = _H
+            except Exception:
+                # Don’t block; we’ll let the streaming generator handle it
                 pass
 
         resp_headers, status = {}, 200
@@ -116,7 +136,6 @@ async def play(video_id: str, request: Request, policy: str = "h264_mp4", itag: 
                 try:
                     rc = proc.poll()
                     if rc not in (0, None):
-                        # Swallow ffmpeg error after start; client will retry
                         try:
                             _ = (proc.stderr.read() or b"").decode("utf-8", "ignore")
                         except Exception:
@@ -148,7 +167,22 @@ async def play_head(video_id: str, request: Request, policy: str = "h264_mp4", i
         except Exception:
             hr = None
 
-        # Fallback to tiny ranged GET if Content-Range is missing on HEAD
+        # refresh once if the signed URL is stale (403/410), mirroring GET path
+        if hr is not None and hr.status_code in (403, 410):
+            try:
+                info2 = ytdlp_dump(video_id)
+                stream2 = pick_by_itag(info2, itag) if itag else pick_stream(info2, policy)
+                if stream2 and stream2.get("kind") == "muxed" and "url" in stream2:
+                    target = stream2["url"]
+                    headers = merge_headers(yt_headers(info2), passthru)
+                    try:
+                        hr = await probe_headers(target, headers)
+                    except Exception:
+                        hr = None
+            except Exception:
+                pass
+
+        # Fallback to tiny ranged GET if HEAD lacks useful headers
         if headers.get("Range") and (hr is None or ("Content-Range" not in (hr.headers or {}))):
             try:
                 async with httpx.AsyncClient(timeout=15, follow_redirects=True) as cx:
@@ -171,4 +205,5 @@ async def play_head(video_id: str, request: Request, policy: str = "h264_mp4", i
         resp_headers.setdefault("Accept-Ranges", "bytes")
         return Response(status_code=status, headers=resp_headers)
 
+    # Generic OK for clients that only preflight the endpoint
     return Response(status_code=200, headers={"Content-Type": "video/mp4"})

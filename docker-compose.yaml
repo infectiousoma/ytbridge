@@ -5,6 +5,9 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ytbridge
+    dns:
+#      - 1.1.1.1
+      - 172.17.0.1
     environment:
       - BACKEND_PROVIDER=${BACKEND_PROVIDER:-invidious}
       - BACKEND_BASE=${BACKEND_BASE:-https://yewtu.be}
@@ -30,6 +33,8 @@ services:
       - ~/.yt-dlp/bin/yt-dlp_linux:/usr/local/bin/yt-dlp_linux
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
+    networks:
+      - jellyfin
     depends_on:
       - redis
     restart: unless-stopped
@@ -40,4 +45,9 @@ services:
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports:
       - "127.0.0.1:6379:6379"
+    networks:
+      - jellyfin
     restart: unless-stopped
+networks:
+  jellyfin:
+    external: true
