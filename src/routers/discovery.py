@@ -37,7 +37,6 @@ async def search(q: str, type: str = "video", page: int = 1, limit: int = 30):
     if config.BACKEND_PROVIDER == "invidious":
         r = await backend_get("/api/v1/search", {"q": q, "page": page, "type": type_map[type]})
     elif config.BACKEND_PROVIDER == "piped":
-        # Piped ignores page/type differently; keep simple query passthrough
         r = await backend_get("/api/v1/search", {"q": q})
     else:
         raise HTTPException(500, "Unsupported BACKEND_PROVIDER")
@@ -50,24 +49,17 @@ async def search(q: str, type: str = "video", page: int = 1, limit: int = 30):
 
 @router.get("/channel/{channel_id}")
 async def channel(channel_id: str, page: int = 1):
-    """
-    Always return an array of items for the channel feed, regardless of provider.
-    Invidious: already returns a list.
-    Piped: returns an object; we normalize to a list by taking a likely array field.
-    """
     if config.BACKEND_PROVIDER == "invidious":
         r = await backend_get(f"/api/v1/channels/{channel_id}/videos", {"page": page})
         if r.status_code != 200:
             raise HTTPException(r.status_code, f"Upstream channel error: {r.text[:200]}")
         data = r.json()
-        # Ensure array
         return JSONResponse(data if isinstance(data, list) else [])
     elif config.BACKEND_PROVIDER == "piped":
         r = await backend_get(f"/api/v1/channel/{channel_id}")
         if r.status_code != 200:
             raise HTTPException(r.status_code, f"Upstream channel error: {r.text[:200]}")
         obj = r.json() or {}
-        # Piped commonly uses "relatedStreams"; sometimes "videos" or "content"
         arr = obj.get("relatedStreams") or obj.get("videos") or obj.get("content") or []
         if not isinstance(arr, list):
             arr = []
@@ -95,7 +87,7 @@ async def item(video_id: str):
         raise HTTPException(r.status_code, f"Upstream item error: {r.text[:200]}")
     meta = r.json()
 
-    # Enrich with yt-dlp data, but don't fail the endpoint if yt-dlp errors
+    # Enrich with yt-dlp; swallow yt-dlp errors into _ytdlp_error
     try:
         info = ytdlp_dump(video_id)
         meta["chapters"]  = info.get("chapters") or []
@@ -115,28 +107,24 @@ async def item(video_id: str):
 
 @router.get("/formats/{video_id}")
 def list_formats(video_id: str, debug: bool = False):
-    try:
-        info = ytdlp_dump(video_id)
-        fmts = map_formats(info)
+    # ytdlp_dump raises HTTPException(502/500) on network/parse errors
+    info = ytdlp_dump(video_id)
+    fmts = map_formats(info)
 
-        # Prefer progressive first (has_video & has_audio), then height desc, then tbr desc
-        def _key(x):
-            progressive_rank = 0 if (x.get("has_video") and x.get("has_audio")) else 1
-            return (progressive_rank, -(x.get("height") or 0), -(x.get("tbr") or 0.0))
+    # Prefer progressive first (has_video & has_audio), then height desc, then tbr desc
+    def _key(x):
+        progressive_rank = 0 if (x.get("has_video") and x.get("has_audio")) else 1
+        return (progressive_rank, -(x.get("height") or 0), -(x.get("tbr") or 0.0))
 
-        fmts.sort(key=_key)
+    fmts.sort(key=_key)
 
-        payload = {"id": video_id, "title": info.get("title"), "formats": fmts}
-        if debug:
-            payload["_raw_extractors"] = {
-                "extractor": info.get("extractor"),
-                "webpage_url": info.get("webpage_url")
-            }
-        return payload
-    except HTTPException as e:
-        code = getattr(e, "status_code", 500) or 500
-        detail = getattr(e, "detail", str(e))
-        raise HTTPException(code, f"yt-dlp failed for {video_id}: {detail}")
+    payload = {"id": video_id, "title": info.get("title"), "formats": fmts}
+    if debug:
+        payload["_raw_extractors"] = {
+            "extractor": info.get("extractor"),
+            "webpage_url": info.get("webpage_url")
+        }
+    return payload
 
 @router.get("/diag/yt-dlp")
 def diag_ytdlp(video_id: str):
