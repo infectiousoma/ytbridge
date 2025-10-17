@@ -46,3 +46,6 @@ PORT = int(os.environ.get("PORT", "8080"))
 # --- data files ---
 SUBS_PATH = str(pathlib.Path(DATA_DIR) / "subscriptions.json")
 FAVS_PATH = str(pathlib.Path(DATA_DIR) / "favorites.json")
+
+# --- redirect ---
+STREAM_MODE = os.getenv("STREAM_MODE", "proxy").lower()   # "proxy" or "redirect"

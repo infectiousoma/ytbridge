@@ -1,7 +1,7 @@
 # routers/playback.py
 import subprocess
 from fastapi import APIRouter, Request, HTTPException, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 import httpx
 
 from .. import config
@@ -26,6 +26,8 @@ async def play(video_id: str, request: Request, policy: str = "h264_mp4", itag: 
         if request.headers.get("Range"):    passthru["Range"]    = request.headers["Range"]
         if request.headers.get("If-Range"): passthru["If-Range"] = request.headers["If-Range"]
         hdrs = merge_headers(yt_headers(info), passthru)
+        if getattr(config, "STREAM_MODE", "proxy") == "redirect":
+           return RedirectResponse(target, status_code=302)
 
         async def generator(target_url: str, hdrs: dict):
             async with httpx.AsyncClient(timeout=None, follow_redirects=True) as cx:
@@ -161,6 +163,9 @@ async def play_head(video_id: str, request: Request, policy: str = "h264_mp4", i
         if request.headers.get("If-Range"): passthru["If-Range"] = request.headers["If-Range"]
         headers = merge_headers(yt_hdrs, passthru)
 
+    if getattr(config, "STREAM_MODE", "proxy") == "redirect":
+        return RedirectResponse(target, status_code=302)
+        
         hr = None
         try:
             hr = await probe_headers(target, headers)
