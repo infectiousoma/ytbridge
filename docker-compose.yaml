@@ -9,19 +9,17 @@ services:
 #      - 1.1.1.1
       - 172.17.0.1
     environment:
-      - BACKEND_PROVIDER=${BACKEND_PROVIDER:-invidious}
-      - BACKEND_BASE=${BACKEND_BASE:-https://yewtu.be}
-      - YTDLP_MODE=${YTDLP_MODE:-local}
-      # Point to your mounted host binary (see volume below)
-      - YTDLP_CMD=${YTDLP_CMD:-/usr/local/bin/yt-dlp_linux}
-      # Use your original cookies path if you used it before, or leave empty
-      - YTDLP_COOKIES=${YTDLP_COOKIES:-/app/cookies.txt}
-      - SPONSORBLOCK=${SPONSORBLOCK:-true}
-      - PORT=${PORT:-8080}
-      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
-      - REDIS_TTL=${REDIS_TTL:-43200}
-      - FFMPEG_CMD=${FFMPEG_CMD:-ffmpeg}
-      - DATA_DIR=${DATA_DIR:-/data}
+      - STREAM_MODE=proxy
+      - BACKEND_PROVIDER=ytdlp      # ← explicit, not ${...}
+      - BACKEND_BASE=               # ← empty to disable invidious
+      - YTDLP_MODE=local
+      - YTDLP_CMD=/usr/local/bin/yt-dlp_linux
+      - YTDLP_COOKIES=/app/cookies.txt
+      - PORT=8080
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_TTL=43200
+      - FFMPEG_CMD=ffmpeg
+      - DATA_DIR=/data
     volumes:
       # Code (optional live mount)
       - ./src:/app/src:ro

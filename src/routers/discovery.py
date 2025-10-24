@@ -21,8 +21,12 @@ async def healthz():
         cookies_meta["size"] = None
     return JSONResponse({
         "ok": True,
+        "backend_provider": config.BACKEND_PROVIDER,          # NEW (handy for diag)
+        "backend_base": config.BACKEND_BASE,                  # NEW (handy for diag)
+        "stream_mode": getattr(config, "STREAM_MODE", "proxy"),  # NEW ← confirm redirect/proxy
         "ytdlp_mode": config.YTDLP_MODE,
         "ytdlp_cmd": getattr(config, "YTDLP_BIN", None) or config.YTDLP_CMD,
+        "ytdlp_args": getattr(config, "YTDLP_ARGS", None),    # NEW (handy for diag)
         "remote": config.YTDLP_REMOTE_URL or None,
         "ffmpeg_cmd": config.FFMPEG_CMD,
         "data_dir": config.DATA_DIR,
